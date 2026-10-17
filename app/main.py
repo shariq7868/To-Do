@@ -1,55 +1,80 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-import sqlite3
+from typing import Annotated
 
-from fastapi import FastAPI,HTTPException,status
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from fastapi.staticfile import StaticFiles
-from pydantic import BaseModel,Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, StringConstraints
 
-from app.database import get_connection,init_db
+from app.database import get_connection, init_db
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-FRONTEND_DIR = BASE_DIR / "frontend"
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
 
 @asynccontextmanager
-async def lifspan(app:FastAPI):
+async def lifespan(app: FastAPI):
     init_db()
     yield
 
-app = FastAPI(
-    title="My To-Do",
-    version="1.0.0",
-    lifspan=lifspan,
-)
 
-app.mount(
-    "/static",
-    StaticFiles(directory=str(FRONTEND_DIR)),
-    name="Static",
-)
+app = FastAPI(title="My TO_DO", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR))
+
 
 class TaskCreate(BaseModel):
-    title: str = Field(min_length=1,max_length=200)
+    title: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+
 
 class TaskUpdate(BaseModel):
     completed: bool
 
-def serialize_task(row: sqlite3.Row) -> dict:
-    return{
-        "id":row[id],
-        "title":row["title"],
-        "completed":bool(row["completed"]),
-    }
+
+class Task(BaseModel):
+    id: int
+    title: str
+    completed: bool
+
 
 @app.get("/")
 def home():
-    return FileResponse(FRONTEND_DIR/"index.html")
+    return FileResponse(FRONTEND_DIR / "index.html")
 
-@app.get("/api/tasks")
-def get_task():
-    with get_connection() as connection:
-        rows = connection.execute(
-            "Select id, title, Complete From task"
-        ).fetchall()
-    return [serialize_task(row) for row in rows]
+
+@app.get("/api/tasks", response_model=list[Task])
+def list_tasks():
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute("SELECT id, title, completed FROM task")]
+
+
+@app.post("/api/tasks", response_model=Task)
+def create_task(task: TaskCreate):
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO task (title, completed) VALUES (?, 0)", (task.title,)
+        )
+        return {"id": cursor.lastrowid, "title": task.title, "completed": False}
+
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def update_task(task_id: int, task: TaskUpdate):
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE task SET completed = ? WHERE id = ?", (task.completed, task_id)
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Task not found")
+        row = conn.execute(
+            "SELECT id, title, completed FROM task WHERE id = ?", (task_id,)
+        ).fetchone()
+        return dict(row)
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int):
+    with get_connection() as conn:
+        if conn.execute("DELETE FROM task WHERE id = ?", (task_id,)).rowcount == 0:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"detail": "Task deleted"}   
